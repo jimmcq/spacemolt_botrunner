@@ -466,7 +466,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       await recordMarketData(ctx);
       await analyzeMarket(ctx);
       await tryMissions(ctx);
-      await sellFactionStorageItems(ctx);
     }
 
     // ── Fuel + hull check ──
@@ -474,7 +473,127 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await tryRefuel(ctx);
     await repairShip(ctx);
 
-    // ── Find trade opportunities (market arbitrage + faction storage) ──
+    // ── Priority 1: Sell any non-fuel items already in cargo ──
+    yield "sell_cargo";
+    await bot.refreshCargo();
+    const cargoToSell = bot.inventory.filter(i => {
+      if (i.quantity <= 0) return false;
+      const lower = i.itemId.toLowerCase();
+      return !lower.includes("fuel") && !lower.includes("energy_cell");
+    });
+
+    if (cargoToSell.length > 0 && bot.docked) {
+      const soldHere: string[] = [];
+      const unsold: Array<{ itemId: string; name: string; quantity: number }> = [];
+
+      for (const item of cargoToSell) {
+        const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
+        if (!sResp.error) {
+          soldHere.push(`${item.quantity}x ${item.name}`);
+        } else {
+          unsold.push(item);
+        }
+      }
+      if (soldHere.length > 0) {
+        ctx.log("trade", `Sold cargo: ${soldHere.join(", ")}`);
+        await recordMarketData(ctx);
+      }
+
+      // Items that didn't sell here — find a buyer
+      for (const item of unsold) {
+        if (bot.state !== "running") break;
+        await bot.refreshCargo();
+        const remaining = bot.inventory.find(i => i.itemId === item.itemId)?.quantity ?? 0;
+        if (remaining <= 0) continue;
+
+        // Search mapStore for best buyer
+        const allBuys = mapStore.getAllBuyDemand();
+        const buyer = allBuys
+          .filter(b => b.itemId === item.itemId && b.price > 0)
+          .filter(b => !(b.systemId === bot.system && b.poiId === bot.poi))
+          .sort((a, b) => b.price - a.price)[0];
+
+        if (buyer) {
+          const { jumps } = estimateFuelCost(bot.system, buyer.systemId, settings.fuelCostPerJump);
+          if (jumps < 999) {
+            ctx.log("trade", `${remaining}x ${item.name} unsellable here — taking to ${buyer.poiName} (${buyer.price}cr/ea, ${jumps} jumps)`);
+            if (bot.system !== buyer.systemId) {
+              await ensureUndocked(ctx);
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+              if (!fueled) continue;
+              const arrived = await navigateToSystem(ctx, buyer.systemId, { ...safetyOpts, noJettison: true });
+              if (!arrived) continue;
+            }
+            if (bot.poi !== buyer.poiId) {
+              await ensureUndocked(ctx);
+              const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
+              if (tResp.error && !tResp.error.message.includes("already")) continue;
+              bot.poi = buyer.poiId;
+            }
+            await ensureDocked(ctx);
+            await bot.refreshCargo();
+            const nowHave = bot.inventory.find(i => i.itemId === item.itemId)?.quantity ?? 0;
+            if (nowHave > 0) {
+              const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: nowHave });
+              if (!sResp.error) {
+                ctx.log("trade", `Sold ${nowHave}x ${item.name} at ${buyer.poiName} (${buyer.price}cr/ea)`);
+              }
+            }
+            await recordMarketData(ctx);
+            continue;
+          }
+        }
+
+        // No buyer found — deposit to station storage
+        ctx.log("trade", `No buyer for ${remaining}x ${item.name} — depositing to storage`);
+        await bot.exec("deposit_items", { item_id: item.itemId, quantity: remaining });
+      }
+    }
+
+    // ── Priority 2: Sell station storage items at current market ──
+    if (bot.docked) {
+      await sellFactionStorageItems(ctx);
+
+      // Sell station storage items that this market buys
+      await bot.refreshStorage();
+      if (bot.storage.length > 0) {
+        const marketResp = await bot.exec("view_market");
+        if (marketResp.result && typeof marketResp.result === "object") {
+          const md = marketResp.result as Record<string, unknown>;
+          const listings = (
+            Array.isArray(md) ? md :
+            Array.isArray(md.items) ? md.items :
+            Array.isArray(md.listings) ? md.listings : []
+          ) as Array<Record<string, unknown>>;
+          const buyableHere = new Set(
+            listings.filter(l => ((l.buy_price as number) || 0) > 0).map(l => l.item_id as string)
+          );
+
+          for (const item of bot.storage) {
+            if (item.quantity <= 0) continue;
+            const lower = item.itemId.toLowerCase();
+            if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+            if (!buyableHere.has(item.itemId)) continue;
+
+            // Withdraw and sell
+            await bot.refreshStatus();
+            const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
+            if (freeSpace <= 0) break;
+            const qty = Math.min(item.quantity, freeSpace);
+            const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
+            if (wResp.error) continue;
+            const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: qty });
+            if (!sResp.error) {
+              ctx.log("trade", `Sold ${qty}x ${item.name} from station storage`);
+            } else {
+              await bot.exec("deposit_items", { item_id: item.itemId, quantity: qty });
+            }
+          }
+        }
+      }
+    }
+
+    // ── Priority 3: Find new trade opportunities ──
     yield "find_trades";
     await bot.refreshStatus();
     if (bot.docked) {
