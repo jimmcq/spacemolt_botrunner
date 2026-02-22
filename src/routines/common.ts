@@ -654,6 +654,7 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
+  opts?: { noJettison?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   await bot.refreshStatus();
@@ -687,7 +688,7 @@ export async function ensureFueled(
     }
 
     // Step 3: Nearly out of fuel — jettison cheap cargo + scavenge as last resort
-    if (bot.fuel <= 1) {
+    if (bot.fuel <= 1 && !opts?.noJettison) {
       const cargoResp = await bot.exec("get_cargo");
       if (cargoResp.result && typeof cargoResp.result === "object") {
         const cResult = cargoResp.result as Record<string, unknown>;
@@ -953,7 +954,7 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 20;
@@ -997,7 +998,7 @@ export async function navigateToSystem(
     }
 
     // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 25));
+    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 25), { noJettison: opts.noJettison });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
