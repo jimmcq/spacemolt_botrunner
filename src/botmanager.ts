@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
@@ -104,6 +104,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleStop(action);
     case "add":
       return handleAdd(action);
+    case "remove":
+      return handleRemove(action);
     case "register":
       return handleRegister(action);
     case "chat":
@@ -195,6 +197,28 @@ async function handleAdd(action: WebAction): Promise<WebActionResult> {
   }
   refreshStatusTable();
   return { ok: true, message: `Bot added: ${username}` };
+}
+
+async function handleRemove(action: WebAction): Promise<WebActionResult> {
+  const { username } = action;
+  if (!username) return { ok: false, error: "Username required" };
+
+  const bot = bots.get(username);
+  if (!bot) return { ok: false, error: `Bot not found: ${username}` };
+
+  if (bot.state === "running") bot.stop();
+
+  bots.delete(username);
+  server.clearBotAssignment(username);
+
+  const sessionDir = join(SESSIONS_DIR, username);
+  if (existsSync(sessionDir)) {
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+
+  server.logSystem(`Bot removed: ${username}`);
+  refreshStatusTable();
+  return { ok: true, message: `Bot removed: ${username}` };
 }
 
 async function handleRegister(action: WebAction): Promise<WebActionResult> {

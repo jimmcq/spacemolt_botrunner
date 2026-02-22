@@ -2307,7 +2307,8 @@ function renderBots() {
         <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()">
           ${routines.map(r => `<option value="${esc(r)}"${r === prevRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
         </select>
-        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`;
+        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
+        <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')">Remove</button>`;
     } else if (bot.state === 'running') {
       actions = `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
     }
@@ -2536,7 +2537,8 @@ function renderProfileTopbar() {
       <select id="profile-routine" onchange="renderProfileTopbar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
       </select>
-      <button class="primary sm" onclick="startBotFromProfile()">Start</button>`;
+      <button class="primary sm" onclick="startBotFromProfile()">Start</button>
+      <button class="danger sm" onclick="removeBot('${esc(bot.username)}')">Remove</button>`;
   } else if (bot.state === 'running') {
     actions = `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
   }
@@ -5207,6 +5209,11 @@ function startBot(username) {
 
 function stopBot(username) {
   send({ type: 'stop', bot: username });
+}
+
+function removeBot(username) {
+  if (!confirm(`Remove ${username}? This deletes their session and credentials permanently.`)) return;
+  send({ type: 'remove', username });
 }
 
 function sendChat() {
