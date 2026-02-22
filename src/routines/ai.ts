@@ -139,6 +139,37 @@ async function fetchSkillMd(): Promise<string> {
   }
 }
 
+// ── Live command list from OpenAPI spec ───────────────────────
+
+let cachedCommandList: string | null = null;
+
+async function fetchCommandList(): Promise<string> {
+  if (cachedCommandList) return cachedCommandList;
+  try {
+    const resp = await fetch("https://game.spacemolt.com/api/v2/openapi.json", {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const spec = await resp.json() as { paths?: Record<string, Record<string, { operationId?: string; summary?: string; "x-is-mutation"?: boolean }>> };
+    const queries: string[] = [];
+    const mutations: string[] = [];
+    for (const methods of Object.values(spec.paths ?? {})) {
+      const op = methods?.post;
+      if (!op?.operationId || op.operationId === "createSession") continue;
+      const label = op.summary ? `${op.operationId} — ${op.summary}` : op.operationId;
+      if (op["x-is-mutation"]) mutations.push(label);
+      else queries.push(label);
+    }
+    const lines: string[] = [];
+    if (queries.length) lines.push(`Query commands (free, no tick cost):\n  ${queries.join("\n  ")}`);
+    if (mutations.length) lines.push(`Action commands (costs 1 tick):\n  ${mutations.join("\n  ")}`);
+    cachedCommandList = lines.join("\n\n");
+    return cachedCommandList;
+  } catch {
+    return "(command list unavailable — use get_commands in-game)";
+  }
+}
+
 // ── LLM client ───────────────────────────────────────────────
 
 async function callLlm(
@@ -188,64 +219,19 @@ async function callLlm(
 // parameter names differ. This canonical reference prevents the LLM from
 // guessing wrong parameter names.
 
-const COMMAND_CHEATSHEET = `
-## Exact API Command Reference (v1 parameter names)
+// Critical param rules injected into every prompt — keeps the LLM from guessing wrong names.
+const PARAM_RULES = `
+## Critical Parameter Rules
 
-INFO / QUERY (no params needed, call any time):
-  game_exec("get_status")       — your full state: credits, location, fuel, hull, cargo
-  game_exec("get_system")       — POIs and jump connections in your CURRENT system
-  game_exec("get_poi")          — details on your current POI (ores, resources, station info)
-  game_exec("get_cargo")        — your cargo hold contents
-  game_exec("get_ship")         — ship stats (modules, fuel capacity, hull, shields)
-  game_exec("get_skills")       — your skill levels
-  game_exec("get_nearby")       — players and NPCs at your current location
-  game_exec("survey_system")    — scan system for resource info (requires scanner module)
-  game_exec("search_systems", {text: "name"})  — find a system by name
-  game_exec("find_route", {target_system: "sys_id"})  — server-side route calculation
-
-NAVIGATION (travel = within system, jump = between systems):
-  game_exec("undock")                                 — leave station
-  game_exec("dock")                                   — dock at station (must be AT station POI)
-  game_exec("travel", {target_poi: "poi_id"})         — move to POI IN YOUR CURRENT SYSTEM
-  game_exec("jump",   {target_system: "sys_id"})      — jump to ADJACENT system (costs 2 fuel, 2 ticks)
-
-MINING (must be undocked, at a belt/gas/ice POI — NOT the sun, planet, or station):
-  game_exec("mine")                                   — NO params, just game_exec("mine") — call repeatedly
-  MINE-ABLE types: asteroid_belt, gas_cloud, ice_field, nebula, resource_field
-  NOT mine-able: sun, star, planet, station, wormhole, jump_gate
-
-TRADING (must be docked at a station with market):
-  game_exec("view_market")                            — see market prices here
-  game_exec("buy",  {item_id: "item_id", quantity: 5})
-  game_exec("sell", {item_id: "ore_iron", quantity: 10})
-
-CRAFTING (must be docked at a station with crafting):
-  game_exec("craft", {recipe_id: "recipe_id", count: 1})
-
-STATION SERVICES (must be docked):
-  game_exec("refuel")                                 — refuel with credits
-  game_exec("repair")                                 — repair hull with credits
-  game_exec("deposit_items",  {item_id: "ore_iron", quantity: 10})
-  game_exec("withdraw_items", {item_id: "ore_iron", quantity: 10})
-
-MISSIONS (must be docked):
-  game_exec("get_missions")
-  game_exec("get_active_missions")
-  game_exec("accept_mission",   {mission_id: "id"})
-  game_exec("complete_mission", {mission_id: "id"})
-  game_exec("abandon_mission",  {mission_id: "id"})
-
-SOCIAL:
-  game_exec("chat", {channel: "system", content: "Hello!"})  — channels: system, faction, local
-  game_exec("captains_log_add", {entry: "text"})
-  game_exec("captains_log_list")
-
-CRITICAL RULES — get these wrong and commands will fail:
-  - travel: target_poi must be a POI id (like "poi_belt_0215_1") NOT a system name/id
-  - jump:   target_system must be an ADJACENT system id from get_system connections
-  - Must be UNDOCKED to travel/jump/mine; must be DOCKED to sell/buy/refuel/repair
-  - After get_system, look at the "pois" array for travel targets and "connections" for jump targets
-  - mine() must be called multiple times to fill cargo — each call mines one batch
+- game_exec("travel", {target_poi: "poi_id"})   — target_poi = a POI id from get_system's "pois" array
+- game_exec("jump",   {target_system: "sys_id"}) — target_system = an ADJACENT system id from get_system's "connections"
+- game_exec("mine")  — NO parameters. Never pass target_poi or any params to mine.
+- game_exec("sell",  {item_id: "ore_iron", quantity: 10}) — use the item's snake_case id, NOT its display name
+- game_exec("buy",   {item_id: "item_id", quantity: 5})
+- Must be UNDOCKED to travel/jump/mine; must be DOCKED to sell/buy/craft/refuel/repair
+- MINE-ABLE poi types: asteroid_belt, gas_cloud, ice_field, nebula, resource_field
+- NOT mine-able: sun, star, planet, station, wormhole, jump_gate
+- mine() must be called multiple times to fill cargo — each call mines one batch
 `.trim();
 
 // ── Inline tool-call parser (fallback for models without proper function calling) ──
@@ -696,9 +682,9 @@ const TOOLS: ToolDefinition[] = [
 export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  // ── Load game documentation ──
-  ctx.log("ai", "Fetching game documentation from https://game.spacemolt.com/skill.md ...");
-  const skillMd = await fetchSkillMd();
+  // ── Load game documentation and command list ──
+  ctx.log("ai", "Fetching game documentation and command list...");
+  const [skillMd, commandList] = await Promise.all([fetchSkillMd(), fetchCommandList()]);
   ctx.log("ai", `Game docs loaded (${skillMd.length} chars). Starting AI play loop.`);
 
   yield "init";
@@ -760,12 +746,17 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
       "",
       "---",
       "",
-      COMMAND_CHEATSHEET,
+      "## Available Game Commands",
+      commandList,
+      "",
+      "---",
+      "",
+      PARAM_RULES,
       "",
       "---",
       "",
       "TOOLS AVAILABLE:",
-      "  game_exec(command, params?)   — execute game commands (see cheatsheet above)",
+      "  game_exec(command, params?)   — execute game commands (see command list above)",
       "  map_get_system(system_id)     — cached POI/connection info for a system",
       "  map_find_ore_locations(ore_id)",
       "  map_get_price_spreads(item_id?)",
@@ -781,8 +772,7 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
       "  2. After any error, immediately retry with corrected parameters.",
       "  3. Complete a full activity loop: check state → travel → act → return → sell/deposit.",
       "  4. Call mine() multiple times in a row to fill your cargo hold.",
-      "  5. Only finish when you have genuinely completed meaningful gameplay.",
-      "  6. Save insights and decisions with memory_update before finishing.",
+      "  5. Save insights and decisions with memory_update before finishing.",
       "",
       "IF YOUR TOOL CALLS ARE NOT BEING RECOGNISED, output them as plain JSON instead:",
       '  {"name": "game_exec", "parameters": {"command": "travel", "params": {"target_poi": "poi_id"}}}',
@@ -822,6 +812,8 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Agentic tool-call loop ──
     let toolCallCount = 0;
     let lastText = "";
+    let nudgeCount = 0;
+    const MAX_NUDGES = 2;
 
     try {
       while (toolCallCount < settings.maxToolCallsPerCycle && bot.state === "running") {
@@ -841,11 +833,19 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        // No tool calls (even after text parsing) → LLM is done for this cycle
+        // No tool calls → nudge the LLM to keep acting, or end the cycle
         if (!response.tool_calls || response.tool_calls.length === 0) {
+          if (nudgeCount < MAX_NUDGES) {
+            nudgeCount++;
+            ctx.log("ai", `No tool calls — nudging (${nudgeCount}/${MAX_NUDGES})`);
+            window.push({ role: "user", content: "Continue your mission. Take the next action using tools. Do not describe plans — execute them." });
+            continue;
+          }
           ctx.log("ai", `Done: ${lastText.slice(0, 300)}`);
           break;
         }
+
+        nudgeCount = 0; // reset nudge count whenever the LLM does call a tool
 
         // Execute each tool call and feed results back
         for (const tc of response.tool_calls) {
