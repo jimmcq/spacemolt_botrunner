@@ -938,35 +938,130 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await collectFromStorage(ctx);
     await tryMissions(ctx);
 
-    // Sell trade items
+    // ── Sell trade items ──
     yield "sell";
-    await bot.refreshCargo();
-    const actualInCargo = bot.inventory.find(i => i.itemId === route.itemId);
-    const sellQty = actualInCargo?.quantity ?? 0;
+    let totalSold = 0;
     let sellRevenue = 0;
 
-    if (sellQty <= 0) {
+    // Attempt to sell at current destination
+    await bot.refreshCargo();
+    let remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+
+    if (remaining <= 0) {
       ctx.log("error", `No ${route.itemName} left in cargo (bought ${buyQty}, all consumed during travel)`);
     } else {
-      if (sellQty < buyQty) {
-        ctx.log("trade", `Only ${sellQty}/${buyQty}x ${route.itemName} left (${buyQty - sellQty} consumed during travel)`);
+      if (remaining < buyQty) {
+        ctx.log("trade", `Only ${remaining}/${buyQty}x ${route.itemName} left (${buyQty - remaining} consumed during travel)`);
       }
-      ctx.log("trade", `Selling ${sellQty}x ${route.itemName} at ${route.sellPrice}cr/ea...`);
-      const sellResp = await bot.exec("sell", { item_id: route.itemId, quantity: sellQty });
-      if (sellResp.error) {
-        ctx.log("error", `Sell failed: ${sellResp.error.message}`);
-      } else {
-        // Parse actual revenue from sell response, fall back to route price estimate
+      ctx.log("trade", `Selling ${remaining}x ${route.itemName} at ${route.sellPrice}cr/ea...`);
+      const sellResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+      if (!sellResp.error) {
         const sr = sellResp.result as Record<string, unknown> | undefined;
         const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
-        sellRevenue = earned > 0 ? earned : sellQty * route.sellPrice;
+        // Check how many actually sold
+        await bot.refreshCargo();
+        const afterSell = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+        const sold = remaining - afterSell;
+        totalSold += sold;
+        sellRevenue += earned > 0 ? earned : sold * route.sellPrice;
+        remaining = afterSell;
+        if (remaining > 0) {
+          ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route.itemName} still unsold — buyer demand exhausted`);
+        }
+      } else {
+        ctx.log("error", `Sell failed: ${sellResp.error.message}`);
       }
     }
 
-    // Also sell any other non-fuel items from cargo (e.g. items withdrawn from storage)
+    // If unsold items remain, find another buyer from mapStore
+    if (remaining > 0) {
+      yield "find_next_buyer";
+      const allBuys = mapStore.getAllBuyDemand();
+      const buyers = allBuys
+        .filter(b => b.itemId === route.itemId && b.price > 0)
+        .filter(b => !(b.systemId === bot.system && b.poiId === bot.poi)) // skip current station
+        .sort((a, b) => b.price - a.price);
+
+      for (const buyer of buyers) {
+        if (remaining <= 0 || bot.state !== "running") break;
+        const { jumps } = estimateFuelCost(bot.system, buyer.systemId, settings.fuelCostPerJump);
+        if (jumps >= 999) continue;
+
+        ctx.log("trade", `${remaining}x ${route.itemName} unsold — trying ${buyer.poiName} in ${buyer.systemId} (${buyer.price}cr/ea, ${jumps} jumps)`);
+
+        // Navigate to the buyer
+        if (bot.system !== buyer.systemId) {
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+          if (!fueled) break;
+          const arrived = await navigateToSystem(ctx, buyer.systemId, { ...safetyOpts, noJettison: true });
+          if (!arrived) continue;
+        }
+
+        if (bot.poi !== buyer.poiId) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
+          if (tResp.error && !tResp.error.message.includes("already")) continue;
+          bot.poi = buyer.poiId;
+        }
+
+        await ensureDocked(ctx);
+        await bot.refreshCargo();
+        remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+        if (remaining <= 0) break;
+
+        const sResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+        if (!sResp.error) {
+          const sr = sResp.result as Record<string, unknown> | undefined;
+          const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          await bot.refreshCargo();
+          const afterSell = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+          const sold = remaining - afterSell;
+          totalSold += sold;
+          sellRevenue += earned > 0 ? earned : sold * buyer.price;
+          remaining = afterSell;
+          ctx.log("trade", `Sold ${sold}x ${route.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
+          await recordMarketData(ctx);
+        }
+        break; // only try one alternative buyer, then fall back to storage
+      }
+    }
+
+    // If still unsold, deposit at Sol Central storage
+    if (remaining > 0) {
+      yield "store_unsold";
+      const SOL_CENTRAL = "sol_central";
+      ctx.log("trade", `${remaining}x ${route.itemName} still unsold — storing at Sol Central`);
+
+      // Navigate to Sol Central if needed
+      const solSystem = "sol";
+      if (bot.system !== solSystem) {
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+        if (fueled) {
+          await navigateToSystem(ctx, solSystem, { ...safetyOpts, noJettison: true });
+        }
+      }
+
+      if (bot.poi !== SOL_CENTRAL) {
+        await ensureUndocked(ctx);
+        await bot.exec("travel", { target_poi: SOL_CENTRAL });
+        bot.poi = SOL_CENTRAL;
+      }
+
+      await ensureDocked(ctx);
+      await bot.refreshCargo();
+      remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+      if (remaining > 0) {
+        await bot.exec("deposit_items", { item_id: route.itemId, quantity: remaining });
+        ctx.log("trade", `Deposited ${remaining}x ${route.itemName} to Sol Central storage`);
+      }
+    }
+
+    // Sell any other non-fuel items from cargo
     await bot.refreshCargo();
     for (const item of bot.inventory) {
-      if (item.itemId === route.itemId) continue; // already sold above
+      if (item.itemId === route.itemId) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       if (item.quantity <= 0) continue;
@@ -974,7 +1069,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!sResp.error) {
         ctx.log("trade", `Sold ${item.quantity}x ${item.name} from storage`);
       } else {
-        // Can't sell here — deposit to faction storage (shared pool)
         const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
         if (fResp.error) {
           await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
@@ -985,17 +1079,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Sell faction storage items at this market too
     await sellFactionStorageItems(ctx);
 
-    // Profit = sell revenue minus cost of goods
+    // Profit = sell revenue minus cost of newly purchased goods
     const actualProfit = sellRevenue - investedCredits;
     bot.stats.totalTrades++;
     bot.stats.totalProfit += actualProfit;
 
-    // Record market data at destination
+    // Record market data
     await recordMarketData(ctx);
 
     // ── Trade summary ──
-    const soldLabel = sellQty < buyQty ? `${sellQty}/${buyQty}` : `${buyQty}`;
-    ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — bought at ${route.sourcePoiName} (${route.buyPrice}cr/ea), sold at ${route.destPoiName} (${route.sellPrice}cr/ea) — profit ${actualProfit}cr (${route.jumps} jumps)`);
+    const soldLabel = totalSold < buyQty ? `${totalSold}/${buyQty}` : `${buyQty}`;
+    ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — profit ${actualProfit}cr (${route.jumps} jumps)`);
 
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);
