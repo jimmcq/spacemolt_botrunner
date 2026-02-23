@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { catalogStore } from "../catalogstore.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -320,6 +321,83 @@ function findMostNeededOre(
   return bestOre;
 }
 
+// ── Recipe index + material analysis ─────────────────────────
+
+/** Build a lookup: output_item_id → Recipe. */
+function buildRecipeIndex(recipes: Recipe[]): Map<string, Recipe> {
+  const index = new Map<string, Recipe>();
+  for (const r of recipes) {
+    if (r.output_item_id) index.set(r.output_item_id, r);
+  }
+  return index;
+}
+
+/** Recursively resolve a recipe's ingredient tree down to raw materials (items with no recipe). */
+function flattenToRawMaterials(
+  recipe: Recipe,
+  recipeIndex: Map<string, Recipe>,
+  quantity: number = 1,
+  depth: number = 0,
+): Map<string, number> {
+  if (depth > 5) return new Map();
+  const raw = new Map<string, number>();
+  for (const comp of recipe.components) {
+    const totalNeeded = comp.quantity * quantity;
+    const subRecipe = recipeIndex.get(comp.item_id);
+    if (subRecipe) {
+      const batchesNeeded = Math.ceil(totalNeeded / (subRecipe.output_quantity || 1));
+      const subRaw = flattenToRawMaterials(subRecipe, recipeIndex, batchesNeeded, depth + 1);
+      for (const [id, qty] of subRaw) {
+        raw.set(id, (raw.get(id) || 0) + qty);
+      }
+    } else {
+      raw.set(comp.item_id, (raw.get(comp.item_id) || 0) + totalNeeded);
+    }
+  }
+  return raw;
+}
+
+/** Check if faction storage has enough raw materials. Returns max craftable batches. */
+function checkMaterialAvailability(
+  rawNeeds: Map<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+): { canCraft: boolean; maxBatches: number } {
+  let maxBatches = Infinity;
+  for (const [itemId, neededPerBatch] of rawNeeds) {
+    const available = factionStorage.find(i => i.itemId === itemId)?.quantity || 0;
+    const batches = Math.floor(available / neededPerBatch);
+    if (batches < maxBatches) maxBatches = batches;
+  }
+  if (maxBatches === Infinity) maxBatches = 0;
+  return { canCraft: maxBatches > 0, maxBatches };
+}
+
+/** Compute ore quotas from active craft limits — sum raw ore needs per recipe. */
+function computeOreQuotas(
+  recipes: Recipe[],
+  recipeIndex: Map<string, Recipe>,
+  craftLimits: Record<string, number>,
+): Record<string, number> {
+  const oreNeeds: Record<string, number> = {};
+
+  for (const [recipeId, limit] of Object.entries(craftLimits)) {
+    if (limit <= 0) continue;
+    const recipe = recipes.find(r => r.recipe_id === recipeId || r.name === recipeId);
+    if (!recipe) continue;
+
+    const rawMaterials = flattenToRawMaterials(recipe, recipeIndex);
+    for (const [itemId, qtyPerBatch] of rawMaterials) {
+      // Only include items that are minable ores
+      const oreLocations = mapStore.findOreLocations(itemId);
+      if (oreLocations.length > 0) {
+        oreNeeds[itemId] = (oreNeeds[itemId] || 0) + qtyPerBatch * limit;
+      }
+    }
+  }
+
+  return oreNeeds;
+}
+
 // ── Coordinator routine ──────────────────────────────────────
 
 /**
@@ -423,28 +501,65 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
     // Sort by profit descending
     profitable.sort((a, b) => b.profitPct - a.profitPct);
 
-    // ── Update crafter settings ──
-    if (settings.autoAdjustCraft && profitable.length > 0) {
+    // ── Update crafter settings (material-aware) ──
+    const recipeIndex = buildRecipeIndex(recipes);
+
+    if (settings.autoAdjustCraft) {
       yield "update_craft_limits";
+
+      // Refresh faction storage to check material availability
+      await bot.refreshFactionStorage();
+
       const allSettings = readSettings();
       const crafterSettings = allSettings.crafter || {};
       const currentLimits = (crafterSettings.craftLimits as Record<string, number>) || {};
       const newLimits: Record<string, number> = { ...currentLimits };
 
       const adjustments: string[] = [];
+      const skipped: string[] = [];
+      const profitableIds = new Set<string>();
+
       for (const { recipe, profitPct, usedFallback } of profitable) {
         const recipeId = recipe.recipe_id;
+        profitableIds.add(recipeId);
+
+        // Check if faction storage has raw materials
+        const rawNeeds = flattenToRawMaterials(recipe, recipeIndex);
+        const { canCraft, maxBatches } = checkMaterialAvailability(rawNeeds, bot.factionStorage);
+
+        if (!canCraft) {
+          skipped.push(recipe.name);
+          // Zero out existing limit if materials are gone
+          if (newLimits[recipeId] && newLimits[recipeId] > 0) {
+            newLimits[recipeId] = 0;
+            adjustments.push(`${recipe.name}: ${currentLimits[recipeId] || 0} → 0 (no materials)`);
+          }
+          continue;
+        }
+
         // Scale limit by profit margin — higher profit = higher limit
         const scaledLimit = Math.min(
           settings.maxCraftLimit,
           Math.max(5, Math.round(profitPct / 10) * 5),
         );
+        // Cap at what we can actually craft from available materials
+        const materialCap = maxBatches * recipe.output_quantity;
+        const finalLimit = Math.min(scaledLimit, materialCap);
 
         const prev = newLimits[recipeId] || 0;
-        if (scaledLimit > prev) {
-          newLimits[recipeId] = scaledLimit;
+        if (finalLimit !== prev) {
+          newLimits[recipeId] = finalLimit;
           const suffix = usedFallback ? " ~est" : "";
-          adjustments.push(`${recipe.name}: ${prev} → ${scaledLimit} (${Math.round(profitPct)}%${suffix})`);
+          adjustments.push(`${recipe.name}: ${prev} → ${finalLimit} (${Math.round(profitPct)}%${suffix}, ${maxBatches} batches avail)`);
+        }
+      }
+
+      // Zero out limits for recipes that no longer have demand or profitability
+      for (const [recipeId, limit] of Object.entries(currentLimits)) {
+        if (limit > 0 && !profitableIds.has(recipeId)) {
+          newLimits[recipeId] = 0;
+          const recipeName = recipes.find(r => r.recipe_id === recipeId)?.name || recipeId;
+          adjustments.push(`${recipeName}: ${limit} → 0 (no demand/profit)`);
         }
       }
 
@@ -454,25 +569,42 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
       } else {
         ctx.log("coord", "Craft limits already optimal — no changes");
       }
-    } else if (settings.autoAdjustCraft) {
-      ctx.log("coord", "No profitable crafting opportunities found");
+      if (skipped.length > 0) {
+        ctx.log("coord", `Skipped (no materials): ${skipped.join(", ")}`);
+      }
     }
 
-    // ── Update miner targetOre ──
+    // ── Update miner targetOre + oreQuotas ──
     if (settings.autoAdjustOre) {
       yield "update_ore_target";
       const allSettings = readSettings();
       const crafterLimits = ((allSettings.crafter || {}).craftLimits as Record<string, number>) || {};
       const bestOre = findMostNeededOre(recipes, crafterLimits);
 
+      // Compute ore quotas from active craft limits
+      const oreQuotas = computeOreQuotas(recipes, recipeIndex, crafterLimits);
+      const currentQuotas = ((allSettings.miner || {}).oreQuotas as Record<string, number>) || {};
+      const quotasChanged = JSON.stringify(oreQuotas) !== JSON.stringify(currentQuotas);
+
+      const minerUpdates: Record<string, unknown> = {};
       if (bestOre) {
         const currentOre = ((allSettings.miner || {}).targetOre as string) || "";
         if (bestOre !== currentOre) {
-          writeSettings({ miner: { targetOre: bestOre } });
+          minerUpdates.targetOre = bestOre;
           ctx.log("coord", `Miner target ore: ${currentOre || "(none)"} → ${bestOre}`);
         } else {
           ctx.log("coord", `Miner target ore unchanged: ${bestOre}`);
         }
+      }
+      if (quotasChanged) {
+        minerUpdates.oreQuotas = oreQuotas;
+        const quotaList = Object.entries(oreQuotas)
+          .map(([id, qty]) => `${catalogStore.resolveItemName(id)}: ${qty}`)
+          .join(", ");
+        ctx.log("coord", `Miner ore quotas: ${quotaList || "(cleared)"}`);
+      }
+      if (Object.keys(minerUpdates).length > 0) {
+        writeSettings({ miner: minerUpdates });
       }
     }
 

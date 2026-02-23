@@ -40,6 +40,12 @@ function getCrafterSettings(): {
 
 // ── Recipe/inventory helpers ─────────────────────────────────
 
+interface RecipeSkillReq {
+  skillId: string;
+  skillName: string;
+  level: number;
+}
+
 interface Recipe {
   recipe_id: string;
   name: string;
@@ -47,6 +53,7 @@ interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
+  requiredSkill: RecipeSkillReq | null;
 }
 
 function parseRecipes(data: unknown): Recipe[] {
@@ -79,6 +86,26 @@ function parseRecipes(data: unknown): Recipe[] {
       ? (rawOutputs[0] as Record<string, unknown>) || {}
       : (rawOutputs as Record<string, unknown>) || {};
 
+    // Parse skill requirement from various API shapes
+    let requiredSkill: RecipeSkillReq | null = null;
+    const skillObj = (r.required_skill || r.skill) as Record<string, unknown> | undefined;
+    if (skillObj && typeof skillObj === "object") {
+      const sId = (skillObj.skill_id as string) || (skillObj.id as string) || (skillObj.name as string) || "";
+      const sName = (skillObj.name as string) || sId;
+      const sLevel = (skillObj.level as number) || (skillObj.min_level as number) || 0;
+      if (sId && sLevel > 0) requiredSkill = { skillId: sId, skillName: sName, level: sLevel };
+    }
+    // Also check required_skills: Record<string, number>
+    if (!requiredSkill && r.required_skills && typeof r.required_skills === "object") {
+      const skills = r.required_skills as Record<string, number>;
+      for (const [sId, sLevel] of Object.entries(skills)) {
+        if (sLevel > 0) {
+          requiredSkill = { skillId: sId, skillName: sId, level: sLevel };
+          break; // use the first skill requirement
+        }
+      }
+    }
+
     return {
       recipe_id: (r.recipe_id as string) || (r.id as string) || "",
       name: (r.name as string) || (r.recipe_id as string) || "",
@@ -90,6 +117,7 @@ function parseRecipes(data: unknown): Recipe[] {
       output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || "",
       output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || "",
       output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || 1,
+      requiredSkill,
     };
   }).filter(r => r.recipe_id);
 }
@@ -363,6 +391,8 @@ async function grindCraftingXP(
       if (!isAllowed && !isPrereq) continue;
     }
     if (!hasMaterialsAnywhere(ctx, recipe)) continue;
+    // Only grind recipes we have the skill for
+    if (!canCraftSkillwise(ctx, recipe).ok) continue;
     // Complexity = total number of component items needed
     const complexity = recipe.components.reduce((sum, c) => sum + c.quantity, 0);
     candidates.push({ recipe, complexity });
@@ -418,6 +448,15 @@ async function grindCraftingXP(
   return crafted;
 }
 
+/** Check if the bot has the required skill level to craft a recipe. */
+function canCraftSkillwise(ctx: RoutineContext, recipe: Recipe): { ok: boolean; reason: string } {
+  if (!recipe.requiredSkill) return { ok: true, reason: "" };
+  const { skillId, skillName, level } = recipe.requiredSkill;
+  const myLevel = ctx.bot.getSkillLevel(skillId);
+  if (myLevel >= level) return { ok: true, reason: "" };
+  return { ok: false, reason: `${skillName} Lv${level} required (have Lv${myLevel})` };
+}
+
 // ── Crafter routine ──────────────────────────────────────────
 
 /**
@@ -462,6 +501,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       await sleep(60000);
       continue;
     }
+
+    // ── Refresh skills for pre-craft skill checks ──
+    yield "check_skills";
+    await bot.checkSkills();
 
     // ── Clear cargo space for material withdrawal ──
     await bot.refreshCargo();
@@ -519,6 +562,20 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (needed <= 0) {
         atLimitCount.count++;
+        continue;
+      }
+
+      // ── Skill check: don't withdraw materials if we can't craft this yet ──
+      const skillCheck = canCraftSkillwise(ctx, recipe);
+      if (!skillCheck.ok) {
+        // Skill too low — grind XP on simpler recipes instead of pulling materials
+        const allowedIds = new Set(settings.craftLimits.map(cl => cl.recipeId));
+        const xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
+        if (xpCrafted.length > 0) {
+          skillSummary.push(`${recipe.name} (${skillCheck.reason}, ground ${xpCrafted.join(", ")} for XP)`);
+        } else {
+          skillSummary.push(`${recipe.name} (${skillCheck.reason})`);
+        }
         continue;
       }
 

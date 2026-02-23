@@ -1847,7 +1847,8 @@
     <div class="settings-layout">
       <div class="settings-sidebar">
         <div class="sidebar-header">Bot Types</div>
-        <div class="sidebar-item active" onclick="switchSettingsTab('miner')">Miner</div>
+        <div class="sidebar-item active" onclick="switchSettingsTab('general')">General</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
         <div class="sidebar-item" onclick="switchSettingsTab('crafter')">Crafter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('rescue')">FuelRescue</div>
         <div class="sidebar-item" onclick="switchSettingsTab('explorer')">Explorer</div>
@@ -2097,7 +2098,7 @@ let knownSystems = [];
 let knownOres = [];
 let reconnectDelay = 1000;
 let modalMode = 'add';
-let activeSettingsTab = 'miner';
+let activeSettingsTab = 'general';
 
 // Profile state
 let profileBot = null;       // username of bot being viewed
@@ -2307,7 +2308,8 @@ function renderBots() {
         <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()">
           ${routines.map(r => `<option value="${esc(r)}"${r === prevRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
         </select>
-        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`;
+        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
+        <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
     } else if (bot.state === 'running') {
       actions = `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
     }
@@ -2536,7 +2538,8 @@ function renderProfileTopbar() {
       <select id="profile-routine" onchange="renderProfileTopbar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
       </select>
-      <button class="primary sm" onclick="startBotFromProfile()">Start</button>`;
+      <button class="primary sm" onclick="startBotFromProfile()">Start</button>
+      <button class="danger sm" onclick="removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕ Remove</button>`;
   } else if (bot.state === 'running') {
     actions = `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
   }
@@ -4531,7 +4534,9 @@ function switchSettingsTab(name) {
 
 function renderSettingsPanel() {
   const panel = document.getElementById('settingsContent');
-  if (activeSettingsTab === 'miner') {
+  if (activeSettingsTab === 'general') {
+    renderGeneralSettings(panel);
+  } else if (activeSettingsTab === 'miner') {
     renderMinerSettings(panel);
   } else if (activeSettingsTab === 'crafter') {
     renderCrafterSettings(panel);
@@ -4552,6 +4557,39 @@ function renderSettingsPanel() {
   }
 }
 
+function renderGeneralSettings(panel) {
+  const general = settings.general || {};
+  const factionDonatePct = general.factionDonatePct ?? 10;
+
+  panel.innerHTML = `
+    <h3>General Settings</h3>
+    <div class="settings-desc">Fleet-wide settings that apply to all bot routines.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Faction Profit Donation %</div>
+        <div class="setting-hint">Percentage of profit donated to the faction treasury after each trade/sale. Set to 0 to disable. Applies to miners, traders, salvagers, and harvesters.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="range" id="set-general-donatePct" min="0" max="100" step="5" value="${factionDonatePct}"
+          oninput="document.getElementById('donatePctLabel').textContent = this.value + '%'" style="width:120px" />
+        <span id="donatePctLabel" style="min-width:36px;text-align:right;font-variant-numeric:tabular-nums">${factionDonatePct}%</span>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveGeneralSettings() {
+  const s = {
+    factionDonatePct: parseInt(document.getElementById('set-general-donatePct').value) || 0,
+  };
+  send({ type: 'saveSettings', routine: 'general', settings: s });
+}
+
 function renderMinerSettings(panel) {
   const miner = settings.miner || {};
   const currentSystem = miner.system || '';
@@ -4565,6 +4603,7 @@ function renderMinerSettings(panel) {
   const depositPrimary = depositBot ? `bot:${depositBot}` : depositMode;
   const depositSecondary = depositFallback;
   const targetOre = miner.targetOre || '';
+  const oreQuotas = miner.oreQuotas || {};
 
   const systemOpts = ['<option value="">(current system)</option>'];
   for (const sys of knownSystems) {
@@ -4620,6 +4659,23 @@ function renderMinerSettings(panel) {
     perBotHtml += '</div>';
   }
 
+  // Ore quotas table
+  let quotaRows = '';
+  for (const [oreId, target] of Object.entries(oreQuotas)) {
+    if (target <= 0) continue;
+    const oreName = knownOres.find(o => o.item_id === oreId)?.name || oreId;
+    quotaRows += `<tr data-ore-id="${esc(oreId)}">
+      <td style="padding:4px 8px">${esc(oreName)}</td>
+      <td style="padding:4px 8px"><input type="number" min="1" max="9999" value="${target}" class="ore-quota-qty" style="width:70px" /></td>
+      <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+    </tr>`;
+  }
+
+  const quotaOreOpts = ['<option value="">-- select ore --</option>'];
+  for (const ore of knownOres) {
+    quotaOreOpts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
+  }
+
   panel.innerHTML = `
     <h3>Miner Settings</h3>
     <div class="settings-desc">Configure how mining bots operate. Changes apply to all bots started with the Miner routine.</div>
@@ -4633,6 +4689,24 @@ function renderMinerSettings(panel) {
     </div>
 
     ${perBotHtml}
+
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
+      <div class="setting-label" style="margin-bottom:4px">Ore Quotas</div>
+      <div class="setting-hint" style="margin-bottom:8px">Maintain target stock levels per ore in faction storage. Miners will prioritize the ore with the biggest deficit, traveling cross-system as needed. When all quotas are met, miners fall back to local mining.</div>
+      <table id="ore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${quotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ore-quota-add-ore" style="flex:1">${quotaOreOpts.join('')}</select>
+        <input type="number" id="ore-quota-add-qty" min="1" max="9999" value="50" style="width:70px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow()">Add</button>
+      </div>
+    </div>
 
     <div class="setting-row">
       <div>
@@ -4688,6 +4762,30 @@ function renderMinerSettings(panel) {
   `;
 }
 
+function addOreQuotaRow() {
+  const oreSelect = document.getElementById('ore-quota-add-ore');
+  const qtyInput = document.getElementById('ore-quota-add-qty');
+  const oreId = oreSelect.value;
+  const qty = parseInt(qtyInput.value) || 50;
+  if (!oreId) return;
+  // Check if ore already in table
+  const existing = document.querySelector(`#ore-quota-table tr[data-ore-id="${oreId}"]`);
+  if (existing) {
+    existing.querySelector('.ore-quota-qty').value = qty;
+    return;
+  }
+  const oreName = knownOres.find(o => o.item_id === oreId)?.name || oreId;
+  const tbody = document.querySelector('#ore-quota-table tbody');
+  const tr = document.createElement('tr');
+  tr.dataset.oreId = oreId;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px"><input type="number" min="1" max="9999" value="${qty}" class="ore-quota-qty" style="width:70px" /></td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+  tbody.appendChild(tr);
+  oreSelect.value = '';
+}
+
 function saveMinerSettings() {
   const s = {
     targetOre: document.getElementById('set-miner-targetOre').value,
@@ -4700,6 +4798,14 @@ function saveMinerSettings() {
     refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
   };
+  // Collect ore quotas from table
+  const oreQuotas = {};
+  for (const row of document.querySelectorAll('#ore-quota-table tbody tr')) {
+    const oreId = row.dataset.oreId;
+    const qty = parseInt(row.querySelector('.ore-quota-qty').value) || 0;
+    if (oreId && qty > 0) oreQuotas[oreId] = qty;
+  }
+  s.oreQuotas = oreQuotas;
   send({ type: 'saveSettings', routine: 'miner', settings: s });
 
   // Save per-bot ore overrides
@@ -5207,6 +5313,19 @@ function startBot(username) {
 
 function stopBot(username) {
   send({ type: 'stop', bot: username });
+}
+
+function removeBot(username) {
+  if (!confirm(`Remove bot "${username}"? This will delete its session and credentials.`)) return;
+  send({ type: 'remove', bot: username });
+  // Close profile if viewing the removed bot
+  if (typeof profileBot !== 'undefined' && profileBot === username) {
+    const profileEl = document.getElementById('profile-view');
+    if (profileEl) profileEl.style.display = 'none';
+    const mainEl = document.getElementById('main-view');
+    if (mainEl) mainEl.style.display = '';
+    profileBot = null;
+  }
 }
 
 function sendChat() {

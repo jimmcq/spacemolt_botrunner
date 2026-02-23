@@ -376,6 +376,11 @@ export class Bot {
     this.log("system", "Routine finished");
   }
 
+  /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */
+  getSkillLevel(skillId: string): number {
+    return this.skillLevels.get(skillId) ?? 0;
+  }
+
   /** Fetch skills and log any level-ups since the last check. */
   async checkSkills(): Promise<void> {
     const resp = await this.exec("get_skills");

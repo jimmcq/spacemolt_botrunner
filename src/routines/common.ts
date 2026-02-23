@@ -1341,22 +1341,24 @@ export function logStatus(ctx: RoutineContext): void {
 
 /** Minimum credits a bot must keep before donating to faction. */
 const FACTION_DONATE_FLOOR = 1000;
-/** Fraction of profit donated to faction treasury. */
-const FACTION_DONATE_PCT = 0.10;
 
 /**
- * Donate 10% of the given profit to the faction treasury, as long as the bot
- * will retain at least 1000 credits after the donation.
+ * Donate a configurable % of profit to the faction treasury.
+ * Reads `general.factionDonatePct` from settings (default 10).
+ * Bot retains at least 1000 credits after donation.
  */
 export async function factionDonateProfit(ctx: RoutineContext, profit: number): Promise<void> {
   if (profit <= 0) return;
+  const all = readSettings();
+  const pct = (all.general?.factionDonatePct as number) ?? 10;
+  if (pct <= 0) return;
   const { bot } = ctx;
-  const donation = Math.floor(profit * FACTION_DONATE_PCT);
+  const donation = Math.floor(profit * (pct / 100));
   if (donation <= 0) return;
   if (bot.credits - donation < FACTION_DONATE_FLOOR) return;
   const resp = await bot.exec("faction_deposit_credits", { amount: donation });
   if (!resp.error) {
-    ctx.log("trade", `Donated ${donation}cr to faction treasury (10% of ${profit}cr profit)`);
-    logFactionActivity(ctx, "donation", `Deposited ${donation}cr (10% of ${profit}cr profit)`);
+    ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
+    logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
 }

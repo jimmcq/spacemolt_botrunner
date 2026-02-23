@@ -1,5 +1,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import type { CargoItem } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { catalogStore } from "../catalogstore.js";
 import {
   type SystemPOI,
   isMinablePoi,
@@ -38,6 +40,7 @@ function getMinerSettings(username?: string): {
   depositBot: string;
   targetOre: string;
   acceptMissions: boolean;
+  oreQuotas: Record<string, number>;
 } {
   const all = readSettings();
   const m = all.miner || {};
@@ -76,7 +79,40 @@ function getMinerSettings(username?: string): {
     depositBot: (botOverrides.depositBot as string) || (m.depositBot as string) || "",
     targetOre: (botOverrides.targetOre as string) || (m.targetOre as string) || "",
     acceptMissions,
+    oreQuotas: (m.oreQuotas as Record<string, number>) || {},
   };
+}
+
+// ── Ore quota logic ──────────────────────────────────────────
+
+/**
+ * Pick the best ore to mine based on quota deficits in faction storage.
+ * Returns ore ID with biggest deficit (tie-broken by base_value), or "" if all met.
+ */
+function pickTargetOre(
+  oreQuotas: Record<string, number>,
+  factionStorage: CargoItem[],
+): { oreId: string; deficit: number; current: number; target: number } {
+  const entries: Array<{ oreId: string; deficit: number; current: number; target: number; baseValue: number }> = [];
+
+  for (const [oreId, target] of Object.entries(oreQuotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+    const deficit = target - current;
+    const baseValue = catalogStore.getItem(oreId)?.base_value as number || 0;
+    entries.push({ oreId, deficit, current, target, baseValue });
+  }
+
+  if (entries.length === 0) return { oreId: "", deficit: 0, current: 0, target: 0 };
+
+  // Sort: biggest deficit first, then highest base_value
+  entries.sort((a, b) => b.deficit - a.deficit || b.baseValue - a.baseValue);
+
+  const best = entries[0];
+  // All quotas met → return empty (fall back to local mining)
+  if (best.deficit <= 0) return { oreId: "", deficit: 0, current: best.current, target: best.target };
+
+  return { oreId: best.oreId, deficit: best.deficit, current: best.current, target: best.target };
 }
 
 // ── Mission helpers ───────────────────────────────────────────
@@ -188,6 +224,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
+  /** Systems where all belts were depleted for the current target ore. Cleared each cycle when ore target changes. */
+  const depletedSystems = new Set<string>();
+  let lastTargetOre = "";
 
   while (bot.state === "running") {
     // Re-read settings each cycle so changes take effect without restart
@@ -197,8 +236,29 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
-    const targetOre = settings.targetOre;
+    let targetOre = settings.targetOre;
     const miningSystem = settings.system || "";
+
+    // ── Ore quotas: pick ore with biggest deficit in faction storage ──
+    if (Object.keys(settings.oreQuotas).length > 0) {
+      await bot.refreshFactionStorage();
+      const pick = pickTargetOre(settings.oreQuotas, bot.factionStorage);
+      if (pick.oreId) {
+        targetOre = pick.oreId;
+        const oreName = catalogStore.resolveItemName(pick.oreId);
+        ctx.log("mining", `Quota pick: ${oreName} (${pick.current}/${pick.target}, deficit ${pick.deficit})`);
+      } else if (pick.target > 0) {
+        // All quotas met — clear targetOre so we mine locally
+        targetOre = "";
+        ctx.log("mining", "All ore quotas met — mining locally");
+      }
+    }
+
+    // Reset depleted systems tracker when target ore changes
+    if (targetOre !== lastTargetOre) {
+      depletedSystems.clear();
+      lastTargetOre = targetOre;
+    }
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
@@ -409,8 +469,41 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (bot.state !== "running") break;
 
+    // ── Belt depleted: try another system before returning home ──
+    if (stopReason === "belt depleted" && targetOre && bot.state === "running") {
+      depletedSystems.add(bot.system);
+      const altLocations = mapStore.findOreLocations(targetOre)
+        .filter(loc => !depletedSystems.has(loc.systemId) && loc.systemId !== bot.system);
+
+      if (altLocations.length > 0) {
+        // Prefer systems with a station
+        const withStation = altLocations.filter(loc => loc.hasStation);
+        const nextLoc = withStation.length > 0 ? withStation[0] : altLocations[0];
+
+        ctx.log("mining", `${bot.system} depleted for ${catalogStore.resolveItemName(targetOre)} — trying ${nextLoc.systemName}`);
+
+        // Refuel before the jump
+        const preFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!preFueled && stationPoi) {
+          await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+        }
+
+        const arrived = await navigateToSystem(ctx, nextLoc.systemId, safetyOpts);
+        if (arrived) {
+          // Successfully reached alt system — restart the cycle (skip return home, skip unload)
+          ctx.log("mining", `Arrived at ${nextLoc.systemName} — continuing mining`);
+          continue;
+        }
+        ctx.log("error", `Failed to reach ${nextLoc.systemName} — returning home`);
+      } else {
+        // No alternative systems — clear depleted set (ores regenerate) and return home
+        ctx.log("mining", "All known ore locations depleted — clearing depletion cache, returning home");
+        depletedSystems.clear();
+      }
+    }
+
     // ── Return to home system if we traveled away ──
-    if (targetOre && bot.system !== homeSystem && homeSystem) {
+    if ((targetOre || Object.keys(settings.oreQuotas).length > 0) && bot.system !== homeSystem && homeSystem) {
       yield "return_home";
 
       // Ensure fueled before the journey home
