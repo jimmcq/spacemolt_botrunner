@@ -52,6 +52,7 @@ function getMinerSettings(username?: string): {
   cargoThreshold: number;
   refuelThreshold: number;
   repairThreshold: number;
+  homeSystem: string;
   system: string;
   depositBot: string;
   targetOre: string;
@@ -91,6 +92,7 @@ function getMinerSettings(username?: string): {
     cargoThreshold: (m.cargoThreshold as number) || 80,
     refuelThreshold: (m.refuelThreshold as number) || 50,
     repairThreshold: (m.repairThreshold as number) || 40,
+    homeSystem: (botOverrides.homeSystem as string) || (m.homeSystem as string) || "",
     system: (m.system as string) || "",
     depositBot: (botOverrides.depositBot as string) || (m.depositBot as string) || "",
     targetOre: (botOverrides.targetOre as string) || (m.targetOre as string) || "",
@@ -247,7 +249,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const homeSystem = bot.system;
+  const settings0 = getMinerSettings(bot.username);
+  // Home system: from settings, or wherever the bot is now as fallback
+  const homeSystem = settings0.homeSystem || bot.system;
   /** Systems where all belts were depleted for the current target ore. Cleared each cycle when ore target changes. */
   const depletedSystems = new Set<string>();
   let lastTargetOre = "";
@@ -260,7 +264,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   });
   if (nonFuelCargo.length > 0) {
     // Navigate to home system first so deposits go to the right station
-    if (bot.system !== homeSystem && homeSystem) {
+    if (bot.system !== homeSystem) {
       ctx.log("mining", `Startup: returning to home system ${homeSystem} to deposit cargo...`);
       const fueled = await ensureFueled(ctx, 50);
       if (fueled) {
@@ -268,7 +272,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
     await ensureDocked(ctx);
-    const settings0 = getMinerSettings(bot.username);
     for (const item of nonFuelCargo) {
       if (settings0.depositMode === "faction") {
         const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
