@@ -1217,6 +1217,10 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
 
+  // Skip if cargo is already full or nearly full (less than 5 free)
+  await bot.refreshStatus();
+  if (bot.cargoMax > 0 && bot.cargoMax - bot.cargo < 5) return 0;
+
   const fuelOnly = opts?.fuelOnly ?? false;
 
   const wrecksResp = await bot.exec("get_wrecks");
@@ -1267,9 +1271,12 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       });
 
       if (lootResp.error) {
-        if (lootResp.error.message.toLowerCase().includes("empty") ||
-            lootResp.error.message.toLowerCase().includes("not found")) {
-          break;
+        const errMsg = lootResp.error.message.toLowerCase();
+        if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
+          break; // cargo full — stop looting this wreck
+        }
+        if (errMsg.includes("empty") || errMsg.includes("not found") || errMsg.includes("not in wreck")) {
+          break; // wreck gone or empty
         }
         continue;
       }
