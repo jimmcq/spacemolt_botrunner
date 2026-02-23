@@ -2288,7 +2288,21 @@ function connect() {
 }
 
 // ── Bot table rendering ────────────────────────────────────
+let pendingBotRender = false;
+
 function renderBots() {
+  // Defer re-render if a routine dropdown is focused (prevents closing mid-selection)
+  const active = document.activeElement;
+  if (active && active.tagName === 'SELECT' && (active.id?.startsWith('routine-') || active.id === 'profile-routine')) {
+    if (!pendingBotRender) {
+      pendingBotRender = true;
+      active.addEventListener('change', () => { pendingBotRender = false; renderBots(); }, { once: true });
+      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderBots(); } }, { once: true });
+    }
+    return;
+  }
+  pendingBotRender = false;
+
   const tbody = document.getElementById('botTableBody');
   if (bots.length === 0) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="9">No bots configured</td></tr>';
