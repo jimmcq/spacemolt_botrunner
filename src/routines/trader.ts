@@ -17,6 +17,7 @@ import {
   getModProfile,
   ensureModsFitted,
   maxItemsForCargo,
+  getItemSize,
   readSettings,
   sleep,
 } from "./common.js";
@@ -605,8 +606,16 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.docked) {
       await bot.refreshFactionStorage();
     }
-    const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
     await bot.refreshCargo();
+    // Subtract fuel cell weight from cargo capacity so route planning doesn't over-buy
+    let fuelCellWeight = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) {
+        fuelCellWeight += item.quantity * getItemSize(item.itemId);
+      }
+    }
+    const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
     const cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
     const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
     const factionRoutes = findFactionStorageRoutes(ctx, settings, bot.system, cargoCapacity);
@@ -1375,9 +1384,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       await bot.refreshFactionStorage();
     }
     await bot.refreshCargo();
+    let nextFuelWeight = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) {
+        nextFuelWeight += item.quantity * getItemSize(item.itemId);
+      }
+    }
+    const nextCargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - nextFuelWeight);
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
-    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
-    const nextFactionRoutes = findFactionStorageRoutes(ctx, settings, bot.system, cargoCapacity);
+    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, nextCargoCapacity);
+    const nextFactionRoutes = findFactionStorageRoutes(ctx, settings, bot.system, nextCargoCapacity);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes, ...nextFactionRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     if (nextRoutes.length > 0) {
