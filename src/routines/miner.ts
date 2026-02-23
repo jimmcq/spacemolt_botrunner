@@ -4,7 +4,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import {
   type SystemPOI,
-  isMinablePoi,
+  isOreBeltPoi,
   isStationPoi,
   findStation,
   parseSystemData,
@@ -381,7 +381,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Fallback: find belt with target ore
     if (!beltPoi && targetOre) {
       for (const poi of pois) {
-        if (isMinablePoi(poi.type)) {
+        if (isOreBeltPoi(poi.type)) {
           const sysData = mapStore.getSystem(bot.system);
           const storedPoi = sysData?.pois.find(p => p.id === poi.id);
           if (storedPoi?.ores_found.some(o => o.item_id === targetOre)) {
@@ -394,7 +394,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Fallback: any minable POI
     if (!beltPoi) {
-      const minable = pois.find(p => isMinablePoi(p.type));
+      const minable = pois.find(p => isOreBeltPoi(p.type));
       if (minable) beltPoi = { id: minable.id, name: minable.name };
     }
 
@@ -417,7 +417,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Check belt depletion — switch to an alternative if exhausted ──
     yield "check_belt";
     if (await isBeltDepleted(ctx)) {
-      const altBelt = pois.find(p => isMinablePoi(p.type) && p.id !== beltPoi!.id);
+      const altBelt = pois.find(p => isOreBeltPoi(p.type) && p.id !== beltPoi!.id);
       if (altBelt) {
         ctx.log("mining", `${beltPoi.name} depleted, switching to ${altBelt.name}`);
         const altTravel = await bot.exec("travel", { target_poi: altBelt.id });

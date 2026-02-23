@@ -47,12 +47,20 @@ export interface SystemInfo {
 
 // ── POI classification ───────────────────────────────────────
 
-/** Check if a POI type is a minable resource location (belt, gas cloud, nebula, etc.) */
+/** Check if a POI type is ANY minable resource location (belt, gas cloud, nebula, ice, etc.) */
 export function isMinablePoi(type: string): boolean {
   const t = type.toLowerCase();
   return t.includes("asteroid") || t.includes("gas") || t.includes("cloud")
     || t.includes("nebula") || t.includes("field") || t.includes("ring")
     || t.includes("belt") || t.includes("resource");
+}
+
+/** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds or ice fields). */
+export function isOreBeltPoi(type: string): boolean {
+  const t = type.toLowerCase();
+  if (t.includes("gas") || t.includes("cloud") || t.includes("nebula") || t.includes("ice")) return false;
+  return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
+    || t.includes("field") || t.includes("resource");
 }
 
 /** Check if a POI is a gas cloud. */
@@ -64,7 +72,7 @@ export function isGasCloudPoi(type: string): boolean {
 /** Check if a POI is an ice field. */
 export function isIceFieldPoi(type: string): boolean {
   const t = type.toLowerCase();
-  return t.includes("ice") || t.includes("field");
+  return t.includes("ice");
 }
 
 /** Check if a POI type is purely scenic (only needs one visit). */

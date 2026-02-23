@@ -214,18 +214,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // Also deposit credits to faction
-  await bot.refreshStatus();
-  const keepCredits = 500; // keep a small amount for fuel purchases
-  const excessCredits = bot.credits - keepCredits;
-  if (excessCredits > 0) {
-    const cResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-    if (!cResp.error) {
-      deposited.push(`${excessCredits}cr → faction treasury`);
-      logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr to faction treasury (cleanup)`);
-    }
-  }
-
   if (deposited.length > 0) {
     ctx.log("trade", `Deposited at home: ${deposited.join(", ")}`);
     await bot.refreshCargo();
