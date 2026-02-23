@@ -28,6 +28,19 @@ import {
 
 type DepositMode = "storage" | "faction" | "sell" | "gift";
 
+const DEFAULT_ORE_QUOTA = 1000;
+
+/** Default ore quotas: all known ores from map at 1000 each. Returns {} if no ores known yet. */
+function defaultOreQuotas(): Record<string, number> {
+  const ores = mapStore.getAllKnownOres();
+  if (ores.length === 0) return {};
+  const quotas: Record<string, number> = {};
+  for (const ore of ores) {
+    quotas[ore.item_id] = DEFAULT_ORE_QUOTA;
+  }
+  return quotas;
+}
+
 /** Read miner settings from data/settings.json.
  *  Per-bot overrides for targetOre, depositMode, depositBot are checked first. */
 function getMinerSettings(username?: string): {
@@ -79,7 +92,7 @@ function getMinerSettings(username?: string): {
     depositBot: (botOverrides.depositBot as string) || (m.depositBot as string) || "",
     targetOre: (botOverrides.targetOre as string) || (m.targetOre as string) || "",
     acceptMissions,
-    oreQuotas: (m.oreQuotas as Record<string, number>) || {},
+    oreQuotas: (m.oreQuotas as Record<string, number>) || defaultOreQuotas(),
   };
 }
 
