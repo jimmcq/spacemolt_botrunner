@@ -391,6 +391,8 @@ async function grindCraftingXP(
       });
       if (!isAllowed && !isPrereq) continue;
     }
+    // Skip recipes with no ingredients — they grant no skill XP
+    if (recipe.components.length === 0) continue;
     if (!hasMaterialsAnywhere(ctx, recipe)) continue;
     // Only grind recipes we have the skill for
     if (!canCraftSkillwise(ctx, recipe).ok) continue;
