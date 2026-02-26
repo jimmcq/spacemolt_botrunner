@@ -2405,7 +2405,7 @@ function renderStatsTab() {
   document.getElementById('pStatSystems').textContent = num(tSystems);
 
   // Faction funds
-  const treasury = factionData ? (factionData.treasury ?? factionData.credits ?? null) : null;
+  const treasury = factionTreasury ?? (factionData ? (factionData.treasury ?? factionData.credits ?? null) : null);
   document.getElementById('pStatFaction').textContent = treasury != null ? num(treasury) + 'cr' : '-';
 
   const tbody = document.getElementById('statsTableBody');
@@ -2472,8 +2472,7 @@ function renderStats() {
   document.getElementById('statCredits').textContent = num(credits) + 'cr';
   document.getElementById('statSystems').textContent = num(systems);
   document.getElementById('statActive').textContent = active;
-  // Faction funds from cached factionData
-  const treasury = factionData ? (factionData.treasury ?? factionData.credits ?? null) : null;
+  const treasury = factionTreasury ?? (factionData ? (factionData.treasury ?? factionData.credits ?? null) : null);
   document.getElementById('statFaction').textContent = treasury != null ? num(treasury) : '-';
 }
 
@@ -2481,20 +2480,19 @@ let _factionFundsInFlight = false;
 /** Fetch faction treasury in the background for the stats bar. */
 function refreshFactionFunds() {
   if (_factionFundsInFlight) return;
-  // Prefer a running bot (more likely to have an active session)
-  const running = bots.filter(b => b.state === 'running');
-  const pick = running.length > 0 ? running[0] : bots[0];
-  if (!pick) return;
+  // faction_info does not return credits/treasury — use view_faction_storage which does,
+  // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
+  const docked = bots.filter(b => b.docked);
+  const pick = docked.find(b => b.state === 'running') ?? docked[0] ?? null;
+  if (!pick) return; // no docked bot — try again next tick
 
   _factionFundsInFlight = true;
-  // faction_info does not return credits/treasury — use view_faction_storage with a
-  // station_id placeholder which bypasses the docking requirement and returns credits.
-  sendExec(pick.username, 'view_faction_storage', { station_id: 'any' }, (result) => {
+  sendExec(pick.username, 'view_faction_storage', undefined, (result) => {
     _factionFundsInFlight = false;
     if (result.ok && result.data) {
       const credits = result.data.credits ?? null;
       if (credits != null) {
-        // Merge credits into factionData so renderStats() can also use it
+        factionTreasury = credits;
         if (factionData) factionData.treasury = credits;
         const label = num(credits) + 'cr';
         document.getElementById('statFaction').textContent = label;
@@ -5682,6 +5680,7 @@ let missionsSelectedBot = null;
 let activeMissionsCache = {};
 let factionSelectedBot = null;
 let factionData = null; // cached faction_info result
+let factionTreasury = null; // cached credit balance from view_faction_storage
 let factionActivePanel = 'overview'; // overview | members | storage | facilities | diplomacy | intel | rooms | missions | activity
 let factionLogLines = [];       // all faction log entries
 let factionLogFilter = 'all';   // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
